@@ -10,7 +10,15 @@ from binance.client import Client
 import warnings
 warnings.filterwarnings('ignore')
 
-# Default coins for universal training
+from flask import Flask, jsonify, send_file
+
+# -------------------------
+# Config / Defaults
+# -------------------------
+CSV_FILENAME = os.getenv("CSV_FILENAME", "universal_features.csv")
+AUTO_RUN_ON_STARTUP = os.getenv("AUTO_RUN_ON_STARTUP", "true").lower() == "true"
+
+# Default coins for universal training (kept small-ish to avoid long runs)
 DEFAULT_TRAINING_COINS = [
     'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT',
     'XRPUSDT', 'DOGEUSDT', 'SHIBUSDT', 'ADAUSDT',
@@ -56,7 +64,6 @@ class UniversalDataCollector:
                 df[col] = df[col].astype(float)
 
             df.set_index('timestamp', inplace=True)
-            # Keep full set for per-coin feature engineering
             return df[['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trades']]
 
         except Exception as e:
@@ -65,24 +72,16 @@ class UniversalDataCollector:
 
 
 class UniversalFeatureEngineer:
-    """
-    Feature engineering PER COIN to prevent cross-coin leakage.
-    """
-
     @staticmethod
     def add_normalized_features_coinwise(coin_df):
-        """
-        Engineer features for a single coin DataFrame (index=timestamp).
-        All rolling/ewm/vwap calculations are done only within this coin.
-        """
         df = coin_df.copy()
 
-        # PRICE RETURNS (percent)
+        # PRICE RETURNS
         df['return_1'] = df['close'].pct_change(1)
         df['return_5'] = df['close'].pct_change(5)
         df['return_15'] = df['close'].pct_change(15)
 
-        # SMA / EMA ratios (ratios to avoid absolute scale)
+        # SMA / EMA ratios
         for period in [5, 10, 20, 50]:
             sma = df['close'].rolling(window=period, min_periods=1).mean()
             df[f'sma_{period}_ratio'] = df['close'] / (sma + 1e-10)
@@ -170,7 +169,6 @@ class UniversalFeatureEngineer:
 
         # Momentum / streaks (per coin)
         df['consecutive_up'] = (df['close'] > df['close'].shift(1)).astype(int)
-        # Group-based streak (resets correctly per coin index)
         df['up_streak'] = (df['consecutive_up'].groupby((df['consecutive_up'] != df['consecutive_up'].shift()).cumsum()).cumsum()).fillna(0)
         df['momentum_5_pct'] = (df['close'] - df['close'].shift(5)) / (df['close'].shift(5) + 1e-10)
         df['momentum_10_pct'] = (df['close'] - df['close'].shift(10)) / (df['close'].shift(10) + 1e-10)
@@ -179,20 +177,13 @@ class UniversalFeatureEngineer:
 
     @classmethod
     def engineer_all_universal_features_for_symbol(cls, df, symbol):
-        """
-        Engineer features for a single symbol and attach symbol column.
-        """
         df_feat = cls.add_normalized_features_coinwise(df)
         df_feat = df_feat.dropna()
         df_feat['symbol'] = symbol
         return df_feat
 
 
-def collect_universal_dataset(symbols=None, interval='5m', lookback_days=30,
-                              save_to='universal_features.csv'):
-    """
-    Collect multi-coin data and engineer features per coin (no cross-coin leakage).
-    """
+def collect_universal_dataset(symbols=None, interval='5m', lookback_days=30, save_to=CSV_FILENAME):
     if symbols is None:
         symbols = DEFAULT_TRAINING_COINS
 
@@ -227,10 +218,7 @@ def collect_universal_dataset(symbols=None, interval='5m', lookback_days=30,
         print("❌ No coin data collected/engineered.")
         return None
 
-    # concat (safe because all features computed per-coin)
     combined = pd.concat(all_feature_frames, ignore_index=False)
-    # keep index name as timestamp. Do not sort across coins (we will rely on per-coin time-aware operations later)
-    # but for convenience, sort by index then symbol to keep deterministic order
     combined = combined.sort_index().reset_index().set_index('timestamp')
 
     print(f"\nCombined dataset: {len(combined):,} rows, coins: {combined['symbol'].nunique()}")
@@ -246,120 +234,26 @@ def collect_universal_dataset(symbols=None, interval='5m', lookback_days=30,
 
 
 # ============================================================
-# RENDER / API SERVER + PUSH-TO-GITHUB logic
+# Render / Flask wrapper (pure data service — NO git push)
 # ============================================================
-#
-# Endpoints:
-#   GET /        -> simple health message
-#   GET /collect -> trigger a background collection + (optional) push to GitHub
-#
-# Behavior:
-#   - On startup, if AUTO_RUN_ON_STARTUP=true (default "true"), collection will start in background.
-#   - set GIT_TOKEN env var to enable pushing CSV back into repo.
-#
-from flask import Flask, jsonify
-
-GIT_TOKEN = os.getenv("GIT_TOKEN") or os.getenv("GITHUB_TOKEN")
-GIT_USER_NAME = os.getenv("GIT_USER_NAME", "Render CSV Bot")
-GIT_USER_EMAIL = os.getenv("GIT_USER_EMAIL", "render@example.com")
-AUTO_RUN_ON_STARTUP = os.getenv("AUTO_RUN_ON_STARTUP", "true").lower() == "true"
-AUTO_PUSH_ON_CREATE = os.getenv("AUTO_PUSH_ON_CREATE", "true").lower() == "true"
-CSV_FILENAME = os.getenv("CSV_FILENAME", "universal_features.csv")
-
 app = Flask(__name__)
 
 
-def push_csv_to_github(filename=CSV_FILENAME):
-    """
-    Push the CSV file to the repo using tokenized remote URL (temporary).
-    Restores original remote URL afterwards.
-    """
-    if not GIT_TOKEN:
-        print("ℹ️ GIT_TOKEN not set; skipping push.")
-        return False
-
-    original_origin = None
-    try:
-        # set git user (safe no-op)
-        subprocess.run(["git", "config", "--global", "user.email", GIT_USER_EMAIL], check=False)
-        subprocess.run(["git", "config", "--global", "user.name", GIT_USER_NAME], check=False)
-
-        # get origin url
-        try:
-            origin = subprocess.check_output(["git", "remote", "get-url", "origin"]).decode().strip()
-            original_origin = origin
-        except subprocess.CalledProcessError:
-            print("❌ No git origin found; cannot push CSV from this environment.")
-            return False
-
-        # convert SSH -> https if needed
-        if origin.startswith("git@"):
-            origin_https = origin.replace(":", "/").replace("git@", "https://")
-        else:
-            origin_https = origin
-
-        # build tokenized url (do not log token)
-        token_url = origin_https
-        if origin_https.startswith("https://"):
-            token_url = origin_https.replace("https://", f"https://{GIT_TOKEN}@")
-        else:
-            token_url = f"https://{GIT_TOKEN}@{origin_https}"
-
-        # set remote to tokenized URL temporarily
-        subprocess.run(["git", "remote", "set-url", "origin", token_url], check=True)
-
-        # add & commit & push
-        subprocess.run(["git", "add", filename], check=False)
-        try:
-            subprocess.run(["git", "commit", "-m", "Auto: update universal_features.csv"], check=True)
-        except subprocess.CalledProcessError:
-            # commit may fail if nothing changed; continue to push
-            pass
-
-        try:
-            branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
-        except Exception:
-            branch = "main"
-
-        print(f"📤 Pushing {filename} to origin/{branch} ...")
-        try:
-            subprocess.run(["git", "push", "origin", branch], check=True)
-            print("✅ CSV pushed to GitHub successfully")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️ Git push failed: {e}")
-            return False
-
-    except Exception as e:
-        print("❌ push_csv_to_github error:", e)
-        return False
-    finally:
-        # restore original origin
-        if original_origin:
-            try:
-                subprocess.run(["git", "remote", "set-url", "origin", original_origin], check=False)
-            except Exception:
-                pass
-
-
 def run_collection_pipeline(interval="5m", lookback_days=30, save_to=CSV_FILENAME):
-    """
-    Runs the collection -> save -> optionally push flow.
-    This can be launched in a background thread by the Flask app.
-    """
     try:
         print("🚀 Starting collection pipeline...")
-        df = collect_universal_dataset(symbols=None, interval=interval, lookback_days=lookback_days, save_to=save_to)
+        df = collect_universal_dataset(
+            symbols=None,
+            interval=interval,
+            lookback_days=lookback_days,
+            save_to=save_to
+        )
+
         if df is None:
             print("❌ Collection failed or returned no data.")
             return False
 
-        print(f"✅ CSV created: {save_to}")
-        if AUTO_PUSH_ON_CREATE:
-            pushed = push_csv_to_github(save_to)
-            if not pushed:
-                print("⚠️ Auto-push failed (check GIT_TOKEN / remote config).")
-            return pushed
+        print(f"✅ CSV created successfully: {save_to}")
         return True
 
     except Exception as e:
@@ -378,7 +272,30 @@ def route_collect():
     return jsonify({"status": "started", "message": "Collection started in background"}), 202
 
 
-# Auto-run on start (if enabled)
+@app.route("/status")
+def status():
+    if os.path.exists(CSV_FILENAME):
+        size = os.path.getsize(CSV_FILENAME) / 1024 / 1024
+        return jsonify({
+            "csv_exists": True,
+            "size_mb": round(size, 2)
+        })
+    return jsonify({"csv_exists": False})
+
+
+@app.route("/download")
+def download_csv():
+    """
+    Download the CSV as an attachment if present.
+    Useful for GitHub Actions to curl/download the file from Render.
+    """
+    if os.path.exists(CSV_FILENAME):
+        abs_path = os.path.abspath(CSV_FILENAME)
+        return send_file(abs_path, as_attachment=True)
+    return jsonify({"error": "CSV not found"}), 404
+
+
+# Auto-start on launch if enabled
 def _maybe_autostart():
     if AUTO_RUN_ON_STARTUP:
         print("⚙️ AUTO_RUN_ON_STARTUP enabled -> starting collection in background")
@@ -388,8 +305,7 @@ def _maybe_autostart():
 
 
 if __name__ == "__main__":
-    # When run directly (for local dev or Render), start Flask + maybe autostart collection.
     _maybe_autostart()
     port = int(os.environ.get("PORT", 10000))
-    # Flask simple server used to keep Render instance alive and allow manual trigger
+    # Use Flask dev server to keep Render instance alive; it's fine for this purpose.
     app.run(host="0.0.0.0", port=port)
